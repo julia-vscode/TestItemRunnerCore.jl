@@ -461,7 +461,7 @@ function run_tests(
                             _.textfile.content.content[__.code_range],
                             JuliaWorkspaces.position_at(_.textfile.content, __.code_range.stop)[1],
                             JuliaWorkspaces.position_at(_.textfile.content, __.code_range.stop)[2],
-                            nothing # timeout
+                            Float64(timeout)
                         )
                     ) |>
                     Dict
