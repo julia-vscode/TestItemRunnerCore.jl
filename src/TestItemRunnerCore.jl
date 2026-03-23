@@ -5,7 +5,8 @@ export run_tests, kill_test_processes, terminate_process, get_active_processes,
        TestrunResult, TestrunResultTestitem, TestrunResultTestitemProfile,
        TestrunResultMessage, TestrunResultDefinitionError,
        TestrunRecord, get_run_history, get_active_runs, cancel_run,
-       get_run_result, get_last_run_id
+       get_run_result, get_last_run_id,
+       TestItemRunner, get_runner
 
 # Re-export CancellationTokens API so consumers don't need to reach into internals
 export CancellationTokenSource, CancellationToken, cancel, get_token, is_cancellation_requested
@@ -86,29 +87,6 @@ mutable struct RunContext
     launch_header_printed::Bool
 end
 
-const g_run_contexts = Dict{String,RunContext}()
-const g_run_contexts_lock = ReentrantLock()
-
-function get_run_context(testrun_id::String)
-    lock(g_run_contexts_lock) do
-        get(g_run_contexts, testrun_id, nothing)
-    end
-end
-
-# ── Process tracking ──────────────────────────────────────────────────
-
-const g_processes = Dict{String,ProcessInfo}()
-const g_processes_lock = ReentrantLock()
-
-const g_process_outputs = Dict{String,Vector{String}}()
-const g_process_outputs_lock = ReentrantLock()
-
-function get_active_processes()
-    lock(g_processes_lock) do
-        collect(values(g_processes))
-    end
-end
-
 # ── Run history ───────────────────────────────────────────────────────
 
 mutable struct TestrunRecord
@@ -121,28 +99,69 @@ mutable struct TestrunRecord
     cts::Union{Nothing,CancellationTokenSource}
 end
 
-const g_run_history = Vector{TestrunRecord}()
-const g_run_history_lock = ReentrantLock()
-const _MAX_HISTORY = 20
-const g_run_counter = Ref(0)
+# ── Runner state singleton ────────────────────────────────────────────
+
+mutable struct TestItemRunner
+    controller::TestItemController
+    lock::ReentrantLock
+    run_contexts::Dict{String,RunContext}
+    processes::Dict{String,ProcessInfo}
+    process_outputs::Dict{String,Vector{String}}
+    run_history::Vector{TestrunRecord}
+    run_counter::Ref{Int}
+    max_history::Int
+end
+
+function TestItemRunner(controller::TestItemController; max_history::Int=20)
+    TestItemRunner(
+        controller,
+        ReentrantLock(),
+        Dict{String,RunContext}(),
+        Dict{String,ProcessInfo}(),
+        Dict{String,Vector{String}}(),
+        Vector{TestrunRecord}(),
+        Ref(0),
+        max_history,
+    )
+end
+
+const _g_runner = Ref{TestItemRunner}()
+const _g_runner_lock = ReentrantLock()
+
+function get_run_context(testrun_id::String)
+    runner = get_runner()
+    lock(runner.lock) do
+        get(runner.run_contexts, testrun_id, nothing)
+    end
+end
+
+function get_active_processes()
+    runner = get_runner()
+    lock(runner.lock) do
+        collect(values(runner.processes))
+    end
+end
 
 function get_run_history()
-    lock(g_run_history_lock) do
-        copy(g_run_history)
+    runner = get_runner()
+    lock(runner.lock) do
+        copy(runner.run_history)
     end
 end
 
 function get_active_runs()
-    lock(g_run_history_lock) do
-        filter(r -> r.status == :running, g_run_history)
+    runner = get_runner()
+    lock(runner.lock) do
+        filter(r -> r.status == :running, runner.run_history)
     end
 end
 
 function cancel_run(id::String)
-    lock(g_run_history_lock) do
-        idx = findfirst(r -> r.id == id || startswith(r.id, id), g_run_history)
+    runner = get_runner()
+    lock(runner.lock) do
+        idx = findfirst(r -> r.id == id || startswith(r.id, id), runner.run_history)
         if idx !== nothing
-            rec = g_run_history[idx]
+            rec = runner.run_history[idx]
             if rec.status == :running && rec.cts !== nothing
                 cancel(rec.cts)
                 return true
@@ -153,32 +172,32 @@ function cancel_run(id::String)
 end
 
 function get_last_run_id()
-    lock(g_run_history_lock) do
-        isempty(g_run_history) ? nothing : g_run_history[1].id
+    runner = get_runner()
+    lock(runner.lock) do
+        isempty(runner.run_history) ? nothing : runner.run_history[1].id
     end
 end
 
 function get_run_result(id::String)
-    lock(g_run_history_lock) do
-        idx = findfirst(r -> r.id == id, g_run_history)
+    runner = get_runner()
+    cached = lock(runner.lock) do
+        idx = findfirst(r -> r.id == id, runner.run_history)
         idx === nothing && return nothing
-        rec = g_run_history[idx]
-        if rec.result !== nothing
-            return rec.result
-        end
+        runner.run_history[idx].result
     end
+    cached !== nothing && return cached
     # If still running, build a snapshot from the live RunContext
-    ctx = lock(g_run_contexts_lock) do
-        get(g_run_contexts, id, nothing)
+    ctx = lock(runner.lock) do
+        get(runner.run_contexts, id, nothing)
     end
     ctx === nothing && return nothing
-    _build_result_from_context(id, ctx)
+    _build_result_from_context(runner, id, ctx)
 end
 
-function _build_result_from_context(testrun_id::String, ctx::RunContext)
+function _build_result_from_context(runner::TestItemRunner, testrun_id::String, ctx::RunContext)
     testitem_outputs = ctx.outputs
-    collected_process_outputs = lock(g_process_outputs_lock) do
-        Dict{String,String}(pid => join(chunks) for (pid, chunks) in g_process_outputs)
+    collected_process_outputs = lock(runner.lock) do
+        Dict{String,String}(pid => join(chunks) for (pid, chunks) in runner.process_outputs)
     end
     testitems = TestrunResultTestitem[
         TestrunResultTestitem(
@@ -196,28 +215,29 @@ function _build_result_from_context(testrun_id::String, ctx::RunContext)
     TestrunResult(TestrunResultDefinitionError[], testitems, collected_process_outputs)
 end
 
-function _prune_history!()
+function _prune_history!(runner::TestItemRunner)
     # Keep at most _MAX_HISTORY entries, prune oldest completed
-    while length(g_run_history) > _MAX_HISTORY
-        idx = findlast(r -> r.status != :running, g_run_history)
+    while length(runner.run_history) > runner.max_history
+        idx = findlast(r -> r.status != :running, runner.run_history)
         idx === nothing && break
-        deleteat!(g_run_history, idx)
+        deleteat!(runner.run_history, idx)
     end
 end
 
 function terminate_process(id::String)
-    if isassigned(g_testitemcontroller)
-        TestItemControllers.terminate_test_process(g_testitemcontroller[], id)
+    if isassigned(_g_runner)
+        TestItemControllers.terminate_test_process(_g_runner[].controller, id)
     end
 end
 
-# ── Controller singleton ─────────────────────────────────────────────
+# ── Runner initialization ─────────────────────────────────────────────
 
-const g_testitemcontroller = Ref{TestItemController}()
+function get_runner()
+    isassigned(_g_runner) && return _g_runner[]
+    lock(_g_runner_lock) do
+        isassigned(_g_runner) && return _g_runner[]
 
-function get_testitemcontroller()
-    if !isassigned(g_testitemcontroller)
-        callbacks = ControllerCallbacks(
+        callbacks = TestItemControllers.ControllerCallbacks(
             on_testitem_started = (testrun_id, testitem_id) -> nothing,
             on_testitem_passed = (testrun_id, testitem_id, duration) -> begin
                 ctx = get_run_context(testrun_id)
@@ -285,26 +305,29 @@ function get_testitemcontroller()
             end,
             on_attach_debugger = (testrun_id, debug_pipename) -> nothing,
             on_process_created = (id, package_name, package_uri, project_uri, coverage, env) -> begin
-                lock(g_processes_lock) do
-                    g_processes[id] = ProcessInfo(id, package_name, "Launching")
+                runner = _g_runner[]
+                lock(runner.lock) do
+                    runner.processes[id] = ProcessInfo(id, package_name, "Launching")
                 end
             end,
             on_process_terminated = (id) -> begin
-                lock(g_processes_lock) do
-                    delete!(g_processes, id)
+                runner = _g_runner[]
+                lock(runner.lock) do
+                    delete!(runner.processes, id)
                 end
             end,
             on_process_status_changed = (id, status) -> begin
-                lock(g_processes_lock) do
-                    if haskey(g_processes, id)
-                        old = g_processes[id]
-                        g_processes[id] = ProcessInfo(old.id, old.package_name, status)
+                runner = _g_runner[]
+                lock(runner.lock) do
+                    if haskey(runner.processes, id)
+                        old = runner.processes[id]
+                        runner.processes[id] = ProcessInfo(old.id, old.package_name, status)
                     end
                 end
                 # Print dot for each process launch event
                 if status == "Launching"
-                    lock(g_run_contexts_lock) do
-                        for ctx in values(g_run_contexts)
+                    lock(runner.lock) do
+                        for ctx in values(runner.run_contexts)
                             if ctx.progress_ui == :bar
                                 if !ctx.launch_header_printed
                                     ctx.launch_header_printed = true
@@ -317,24 +340,27 @@ function get_testitemcontroller()
                 end
             end,
             on_process_output = (id, output) -> begin
-                lock(g_process_outputs_lock) do
-                    if !haskey(g_process_outputs, id)
-                        g_process_outputs[id] = String[]
+                runner = _g_runner[]
+                lock(runner.lock) do
+                    if !haskey(runner.process_outputs, id)
+                        runner.process_outputs[id] = String[]
                     end
-                    push!(g_process_outputs[id], output)
+                    push!(runner.process_outputs[id], output)
                 end
             end,
         )
 
-        g_testitemcontroller[] = TestItemController(callbacks)
+        controller = TestItemController(callbacks)
+        runner = TestItemRunner(controller)
+        _g_runner[] = runner
         @async try
-            run(g_testitemcontroller[])
+            run(runner.controller)
         catch err
             Base.display_error(err, catch_backtrace())
         end
-    end
 
-    return g_testitemcontroller[]
+        return runner
+    end
 end
 
 # ── Main entry point ──────────────────────────────────────────────────
@@ -359,9 +385,10 @@ function run_tests(
         print_failed_results = false
     end
 
-    tic = get_testitemcontroller()
-    g_run_counter[] += 1
-    testrun_id = string(g_run_counter[])
+    runner = get_runner()
+    tic = runner.controller
+    runner.run_counter[] += 1
+    testrun_id = string(runner.run_counter[])
 
     # Register in run history
     cts_for_history = if token !== nothing
@@ -371,9 +398,9 @@ function run_tests(
         nothing
     end
     record = TestrunRecord(testrun_id, time(), nothing, :running, nothing, string(path), cts_for_history)
-    lock(g_run_history_lock) do
-        pushfirst!(g_run_history, record)
-        _prune_history!()
+    lock(runner.lock) do
+        pushfirst!(runner.run_history, record)
+        _prune_history!(runner)
     end
 
     jw = JuliaWorkspaces.workspace_from_folders(([path]))
@@ -496,6 +523,10 @@ function run_tests(
 
             # Define progressbar_next reading from ctx so counters update live
             ctx.progressbar_next = () -> begin
+                if ctx.launch_header_printed
+                    ctx.launch_header_printed = false
+                    println()
+                end
                 done = ctx.count_success + ctx.count_fail + ctx.count_error + ctx.count_skipped
                 parts = String[]
                 ctx.count_success > 0 && push!(parts, "$(ctx.count_success) passed")
@@ -511,8 +542,8 @@ function run_tests(
                 )
             end
 
-            lock(g_run_contexts_lock) do
-                g_run_contexts[testrun_id] = ctx
+            lock(runner.lock) do
+                runner.run_contexts[testrun_id] = ctx
             end
 
             ret = try
@@ -560,8 +591,21 @@ function run_tests(
                 @error "TestItemControllers.execute_testrun failed" exception=(err, catch_backtrace())
                 rethrow(err)
             finally
-                lock(g_run_contexts_lock) do
-                    delete!(g_run_contexts, testrun_id)
+                # Snapshot partial results into history before deleting context;
+                # on the success path this is overwritten by the full result below.
+                try
+                    partial = _build_result_from_context(runner, testrun_id, ctx)
+                    lock(runner.lock) do
+                        idx = findfirst(r -> r.id == testrun_id, runner.run_history)
+                        if idx !== nothing && runner.run_history[idx].result === nothing
+                            runner.run_history[idx].result = partial
+                        end
+                    end
+                catch
+                    # Best-effort — don't mask the original exception
+                end
+                lock(runner.lock) do
+                    delete!(runner.run_contexts, testrun_id)
                 end
             end
 
@@ -628,8 +672,8 @@ function run_tests(
     end
 
     # Collect process outputs snapshot
-    collected_process_outputs = lock(g_process_outputs_lock) do
-        Dict{String,String}(id => join(chunks) for (id, chunks) in g_process_outputs)
+    collected_process_outputs = lock(runner.lock) do
+        Dict{String,String}(id => join(chunks) for (id, chunks) in runner.process_outputs)
     end
 
     duplicated_testitems = TestrunResultTestitem[
@@ -658,12 +702,12 @@ function run_tests(
     )
 
     # Update run history with result
-    lock(g_run_history_lock) do
-        idx = findfirst(r -> r.id == testrun_id, g_run_history)
+    lock(runner.lock) do
+        idx = findfirst(r -> r.id == testrun_id, runner.run_history)
         if idx !== nothing
-            g_run_history[idx].result = typed_results
-            g_run_history[idx].status = :completed
-            g_run_history[idx].end_time = time()
+            runner.run_history[idx].result = typed_results
+            runner.run_history[idx].status = :completed
+            runner.run_history[idx].end_time = time()
         end
     end
 
@@ -671,8 +715,8 @@ function run_tests(
 end
 
 function kill_test_processes()
-    if isassigned(g_testitemcontroller)
-        TestItemControllers.shutdown(g_testitemcontroller[])
+    if isassigned(_g_runner)
+        TestItemControllers.shutdown(_g_runner[].controller)
     end
 end
 
