@@ -3,7 +3,7 @@ module TestItemRunnerCore
 export run_tests, kill_test_processes, terminate_process, get_active_processes,
        RunProfile, ProcessInfo,
        TestrunResult, TestrunResultTestitem, TestrunResultTestitemProfile,
-       TestrunResultMessage, TestrunResultDefinitionError,
+       TestrunResultMessage, TestrunResultStackFrame, TestrunResultDefinitionError,
        TestrunRecord, get_run_history, get_active_runs, cancel_run,
        get_run_result, get_last_run_id,
        TestItemRunner, get_runner
@@ -35,11 +35,21 @@ struct ProcessInfo
     status::String
 end
 
-struct TestrunResultMessage
-    message::String
+struct TestrunResultStackFrame
+    label::String
     uri::URI
     line::Int
     column::Int
+end
+
+struct TestrunResultMessage
+    message::String
+    expected_output::Union{String,Missing}
+    actual_output::Union{String,Missing}
+    uri::URI
+    line::Int
+    column::Int
+    stack_frames::Union{Vector{TestrunResultStackFrame},Missing}
 end
 
 struct TestrunResultTestitemProfile
@@ -194,6 +204,33 @@ function get_run_result(id::String)
     _build_result_from_context(runner, id, ctx)
 end
 
+function _convert_stack_frames(stack_trace)
+    stack_trace === missing && return missing
+    return TestrunResultStackFrame[
+        TestrunResultStackFrame(
+            frame.label,
+            frame.uri === missing ? URI("") : URI(frame.uri),
+            coalesce(frame.line, 0),
+            coalesce(frame.column, 0),
+        ) for frame in stack_trace
+    ]
+end
+
+function _convert_messages(messages)
+    messages === missing && return missing
+    return TestrunResultMessage[
+        TestrunResultMessage(
+            msg.message,
+            msg.expectedOutput,
+            msg.actualOutput,
+            msg.uri === missing ? URI("") : URI(msg.uri),
+            coalesce(msg.line, 0),
+            coalesce(msg.column, 0),
+            _convert_stack_frames(msg.stackTrace),
+        ) for msg in messages
+    ]
+end
+
 function _build_result_from_context(runner::TestItemRunner, testrun_id::String, ctx::RunContext)
     testitem_outputs = ctx.outputs
     collected_process_outputs = lock(runner.lock) do
@@ -207,7 +244,7 @@ function _build_result_from_context(runner::TestItemRunner, testrun_id::String, 
                 ti.testenvironment.name,
                 ti.result.status,
                 ti.result.duration,
-                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === missing ? URI("") : URI(msg.uri), coalesce(msg.line, 0), coalesce(msg.column, 0)) for msg in ti.result.messages],
+                _convert_messages(ti.result.messages),
                 haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
             )]
         ) for ti in ctx.responses
@@ -665,6 +702,18 @@ function run_tests(
                 if i.result.messages!==missing                
                     for j in i.result.messages
                         println("    ", replace(j.message, "\n"=>"\n    "))
+                        if j.expectedOutput !== missing || j.actualOutput !== missing
+                            j.expectedOutput !== missing && println("    Expected: ", replace(j.expectedOutput, "\n"=>"\n             "))
+                            j.actualOutput !== missing && println("    Actual:   ", replace(j.actualOutput, "\n"=>"\n             "))
+                        end
+                        if j.stackTrace !== missing
+                            for frame in j.stackTrace
+                                frame_uri = frame.uri !== missing ? frame.uri : "?"
+                                frame_line = coalesce(frame.line, 0)
+                                frame_col = coalesce(frame.column, 0)
+                                println("      at $(frame.label) ($(frame_uri):$(frame_line):$(frame_col))")
+                            end
+                        end
                     end
                 end
             end
@@ -684,7 +733,7 @@ function run_tests(
                 ti.testenvironment.name,
                 ti.result.status,
                 ti.result.duration,
-                ti.result.messages === missing ? missing : [TestrunResultMessage(msg.message, msg.uri === missing ? URI("") : URI(msg.uri), coalesce(msg.line, 0), coalesce(msg.column, 0)) for msg in ti.result.messages],
+                _convert_messages(ti.result.messages),
                 haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
             )]
         ) for ti in responses
