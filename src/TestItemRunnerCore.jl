@@ -12,6 +12,7 @@ export run_tests, kill_test_processes, terminate_process, get_active_processes,
 export CancellationTokenSource, CancellationToken, cancel, get_token, is_cancellation_requested
 
 import ProgressMeter, JuliaWorkspaces, AutoHashEquals, TestItemControllers, Logging
+import UUIDs
 using Query
 
 using JuliaWorkspaces: JuliaWorkspace
@@ -44,20 +45,20 @@ end
 
 struct TestrunResultMessage
     message::String
-    expected_output::Union{String,Missing}
-    actual_output::Union{String,Missing}
+    expected_output::Union{Nothing,String}
+    actual_output::Union{Nothing,String}
     uri::URI
     line::Int
     column::Int
-    stack_frames::Union{Vector{TestrunResultStackFrame},Missing}
+    stack_frames::Union{Nothing,Vector{TestrunResultStackFrame}}
 end
 
 struct TestrunResultTestitemProfile
     profile_name::String
     status::Symbol
-    duration::Union{Float64,Missing}
-    messages::Union{Vector{TestrunResultMessage},Missing}
-    output::Union{String,Missing}
+    duration::Union{Nothing,Float64}
+    messages::Union{Nothing,Vector{TestrunResultMessage}}
+    output::Union{Nothing,String}
 end
 
 struct TestrunResultTestitem
@@ -120,6 +121,7 @@ mutable struct TestItemRunner
     run_history::Vector{TestrunRecord}
     run_counter::Ref{Int}
     max_history::Int
+    test_env_by_id::Dict{String,TestItemControllers.TestEnvironment}
 end
 
 function TestItemRunner(controller::TestItemController; max_history::Int=20)
@@ -132,6 +134,7 @@ function TestItemRunner(controller::TestItemController; max_history::Int=20)
         Vector{TestrunRecord}(),
         Ref(0),
         max_history,
+        Dict{String,TestItemControllers.TestEnvironment}(),
     )
 end
 
@@ -205,28 +208,28 @@ function get_run_result(id::String)
 end
 
 function _convert_stack_frames(stack_trace)
-    stack_trace === missing && return missing
+    stack_trace === nothing && return nothing
     return TestrunResultStackFrame[
         TestrunResultStackFrame(
             frame.label,
-            frame.uri === missing ? URI("") : URI(frame.uri),
-            coalesce(frame.line, 0),
-            coalesce(frame.column, 0),
+            frame.uri === nothing ? URI("") : URI(frame.uri),
+            something(frame.line, 0),
+            something(frame.column, 0),
         ) for frame in stack_trace
     ]
 end
 
 function _convert_messages(messages)
-    messages === missing && return missing
+    messages === nothing && return nothing
     return TestrunResultMessage[
         TestrunResultMessage(
             msg.message,
-            msg.expectedOutput,
-            msg.actualOutput,
-            msg.uri === missing ? URI("") : URI(msg.uri),
-            coalesce(msg.line, 0),
-            coalesce(msg.column, 0),
-            _convert_stack_frames(msg.stackTrace),
+            msg.expected_output,
+            msg.actual_output,
+            msg.uri === nothing ? URI("") : URI(msg.uri),
+            something(msg.line, 0),
+            something(msg.column, 0),
+            _convert_stack_frames(msg.stack_trace),
         ) for msg in messages
     ]
 end
@@ -245,7 +248,7 @@ function _build_result_from_context(runner::TestItemRunner, testrun_id::String, 
                 ti.result.status,
                 ti.result.duration,
                 _convert_messages(ti.result.messages),
-                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
+                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : nothing
             )]
         ) for ti in ctx.responses
     ]
@@ -275,28 +278,28 @@ function get_runner()
         isassigned(_g_runner) && return _g_runner[]
 
         callbacks = TestItemControllers.ControllerCallbacks(
-            on_testitem_started = (testrun_id, testitem_id) -> nothing,
-            on_testitem_passed = (testrun_id, testitem_id, duration) -> begin
+            on_testitem_started = (testrun_id, testitem_id, test_env_id) -> nothing,
+            on_testitem_passed = (testrun_id, testitem_id, test_env_id, duration) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_success += 1
                 testitem = ctx.testitems_by_id[testitem_id]
                 if ctx.progress_ui == :log
-                    duration_string = duration !== missing ? " ($(duration)ms)" : ""
+                    duration_string = duration !== nothing ? " ($(duration)ms)" : ""
                     println("✓ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → passed$duration_string")
                 end
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
-                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:passed, messages=missing, duration=duration)))
+                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:passed, messages=nothing, duration=duration)))
             end,
-            on_testitem_failed = (testrun_id, testitem_id, messages, duration) -> begin
+            on_testitem_failed = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_fail += 1
                 testitem = ctx.testitems_by_id[testitem_id]
                 if ctx.progress_ui == :log
-                    duration_string = duration !== missing ? " ($(duration)ms)" : ""
+                    duration_string = duration !== nothing ? " ($(duration)ms)" : ""
                     println("✗ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → failed$duration_string")
                 end
                 if ctx.progress_ui == :bar
@@ -304,13 +307,13 @@ function get_runner()
                 end
                 push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:failed, messages=messages, duration=duration)))
             end,
-            on_testitem_errored = (testrun_id, testitem_id, messages, duration) -> begin
+            on_testitem_errored = (testrun_id, testitem_id, test_env_id, messages, duration) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_error += 1
                 testitem = ctx.testitems_by_id[testitem_id]
                 if ctx.progress_ui == :log
-                    duration_string = duration !== missing ? " ($(duration)ms)" : ""
+                    duration_string = duration !== nothing ? " ($(duration)ms)" : ""
                     println("✗ $(ctx.environment_name) $(uri2filepath(URI(testitem.uri))):$(testitem.label) → errored$duration_string")
                 end
                 if ctx.progress_ui == :bar
@@ -318,7 +321,7 @@ function get_runner()
                 end
                 push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:errored, messages=messages, duration=duration)))
             end,
-            on_testitem_skipped = (testrun_id, testitem_id) -> begin
+            on_testitem_skipped = (testrun_id, testitem_id, test_env_id) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 ctx.count_skipped += 1
@@ -329,9 +332,9 @@ function get_runner()
                 if ctx.progress_ui == :bar
                     ctx.progressbar_next()
                 end
-                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:skipped, messages=missing, duration=missing)))
+                push!(ctx.responses, (testitem=testitem, testenvironment=ctx.environments[1], result=(status=:skipped, messages=nothing, duration=nothing)))
             end,
-            on_append_output = (testrun_id, testitem_id, output) -> begin
+            on_append_output = (testrun_id, testitem_id, test_env_id, output) -> begin
                 ctx = get_run_context(testrun_id)
                 ctx === nothing && return
                 testitem_id === nothing && return  # process-level output; captured by on_process_output
@@ -341,8 +344,12 @@ function get_runner()
                 push!(ctx.outputs[testitem_id], output)
             end,
             on_attach_debugger = (testrun_id, debug_pipename) -> nothing,
-            on_process_created = (id, package_name, package_uri, project_uri, coverage, env) -> begin
+            on_process_created = (id, test_env_id) -> begin
                 runner = _g_runner[]
+                env = lock(runner.lock) do
+                    get(runner.test_env_by_id, test_env_id, nothing)
+                end
+                package_name = env !== nothing ? env.package_name : ""
                 lock(runner.lock) do
                     runner.processes[id] = ProcessInfo(id, package_name, "Launching")
                 end
@@ -501,34 +508,35 @@ function run_tests(
 
         Logging.with_logger(debuglogger) do
 
-            testitems_to_run_by_id = pairs(JuliaWorkspaces.get_test_items(jw)) |>
-                    @map({uri = _.first, items = _.second.testitems}) |>
-                    @mutate(
-                        project_details = JuliaWorkspaces.get_test_env(jw, _.uri),
-                        textfile = JuliaWorkspaces.get_text_file(jw, _.uri)
-                    ) |>
-                    @mapmany(
-                        _.items,
-                        __.id => 
-                        TestItemControllers.TestItemDetail(
-                            __.id,
-                            string(__.uri),
-                            __.name,
-                            _.project_details.package_name,
-                            string(_.project_details.package_uri),
-                            _.project_details.project_uri === nothing ? nothing : string(_.project_details.project_uri),
-                            string(_.project_details.env_content_hash),
-                            __.option_default_imports,
-                            string.(__.option_setup),
-                            JuliaWorkspaces.position_at(_.textfile.content, __.code_range.start)[1],
-                            JuliaWorkspaces.position_at(_.textfile.content, __.code_range.start)[2],
-                            _.textfile.content.content[__.code_range],
-                            JuliaWorkspaces.position_at(_.textfile.content, __.code_range.stop)[1],
-                            JuliaWorkspaces.position_at(_.textfile.content, __.code_range.stop)[2],
-                            Float64(timeout)
-                        )
-                    ) |>
-                    Dict
+            testitems_to_run_by_id = Dict{String, TestItemControllers.TestItemDetail}()
+                    # Collect package info per item for building per-package TestEnvironments
+                    item_package_info = Dict{String, NamedTuple{(:package_name, :package_uri, :project_uri, :env_content_hash), Tuple{String, String, Union{Nothing,String}, Union{Nothing,String}}}}()
+                    for (uri, file_info) in pairs(JuliaWorkspaces.get_test_items(jw))
+                        project_details = JuliaWorkspaces.get_test_env(jw, uri)
+                        textfile = JuliaWorkspaces.get_text_file(jw, uri)
+                        for item in file_info.testitems
+                            testitems_to_run_by_id[item.id] = TestItemControllers.TestItemDetail(
+                                item.id,
+                                string(item.uri),
+                                item.name,
+                                project_details.package_name,
+                                string(project_details.package_uri),
+                                item.option_default_imports,
+                                string.(item.option_setup),
+                                JuliaWorkspaces.position_at(textfile.content, item.code_range.start)[1],
+                                JuliaWorkspaces.position_at(textfile.content, item.code_range.start)[2],
+                                textfile.content.content[item.code_range],
+                                JuliaWorkspaces.position_at(textfile.content, item.code_range.stop)[1],
+                                JuliaWorkspaces.position_at(textfile.content, item.code_range.stop)[2],
+                            )
+                            item_package_info[item.id] = (
+                                package_name = project_details.package_name,
+                                package_uri = string(project_details.package_uri),
+                                project_uri = project_details.project_uri === nothing ? nothing : string(project_details.project_uri),
+                                env_content_hash = project_details.env_content_hash === nothing ? nothing : string(project_details.env_content_hash),
+                            )
+                        end
+                    end
 
             # Apply filter to the test items dict (the earlier filter on 'testitems' was only for counting)
             if filter !== nothing
@@ -584,44 +592,84 @@ function run_tests(
             end
 
             ret = try
+                # Collect unique packages from the discovered test items
+                unique_packages = Dict{String, NamedTuple}()
+                for (item_id, pkg) in item_package_info
+                    haskey(testitems_to_run_by_id, item_id) || continue
+                    key = pkg.package_uri
+                    if !haskey(unique_packages, key)
+                        unique_packages[key] = pkg
+                    end
+                end
+
+                # Create one TestEnvironment per (package × profile) combination
+                test_envs = TestItemControllers.TestEnvironment[]
+                env_id_for_item = Dict{String, String}()  # item_id → env_id
+                for profile in environments
+                    env_vars = Dict{String,Union{String,Nothing}}(k => v isa AbstractString ? string(v) : v === nothing ? nothing : string(v) for (k,v) in profile.env)
+                    mode = profile.coverage ? "Coverage" : "Normal"
+                    for (pkg_uri, pkg) in unique_packages
+                        env = TestItemControllers.TestEnvironment(
+                            string(UUIDs.uuid4()),
+                            "julia",
+                            String[],
+                            nothing,
+                            env_vars,
+                            mode,
+                            pkg.package_name,
+                            pkg.package_uri,
+                            pkg.project_uri,
+                            pkg.env_content_hash,
+                        )
+                        push!(test_envs, env)
+                        for (item_id, item_pkg) in item_package_info
+                            if item_pkg.package_uri == pkg_uri && haskey(testitems_to_run_by_id, item_id)
+                                env_id_for_item[item_id] = env.id
+                            end
+                        end
+                    end
+                end
+
+                # Register test environments for on_process_created callback
+                lock(runner.lock) do
+                    for env in test_envs
+                        runner.test_env_by_id[env.id] = env
+                    end
+                end
+
+                test_items = collect(values(testitems_to_run_by_id))
+                work_units = [
+                    TestItemControllers.TestRunItem(item.id, env_id_for_item[item.id], nothing, :Info)
+                    for item in test_items
+                ]
+                test_setups = pairs(JuliaWorkspaces.get_test_items(jw)) |>
+                    @map({uri = _.first, items = _.second.testsetups}) |>
+                    @mutate(
+                        project_details = JuliaWorkspaces.get_test_env(jw, _.uri),
+                        textfile = JuliaWorkspaces.get_text_file(jw, _.uri)
+                    ) |>
+                    @filter(_.project_details.package_uri !== nothing) |>
+                    @mapmany(
+                        _.items,
+                        TestItemControllers.TestSetupDetail(
+                            string(_.project_details.package_uri),
+                            string(__.name),
+                            string(__.kind),
+                            string(_.uri),
+                            JuliaWorkspaces.position_at(_.textfile.content, __.code_range.start)[1],
+                            JuliaWorkspaces.position_at(_.textfile.content, __.code_range.start)[2],
+                            _.textfile.content.content[__.code_range]
+                        )
+                    ) |>
+                    i-> collect(TestItemControllers.TestSetupDetail, i)
                 TestItemControllers.execute_testrun(
                     tic,
                     testrun_id,
-                    [
-                        TestItemControllers.TestProfile(
-                            i.name,
-                            "$(i.name) Profile",
-                            "julia",
-                            String[],
-                            missing,
-                            Dict{String,Union{String,Nothing}}(k => v isa AbstractString ? string(v) : v === nothing ? nothing : string(v) for (k,v) in i.env),
-                            max_workers,
-                            i.coverage ? "Coverage" : "Normal",
-                            nothing,
-                            :Info
-                        ) for i in environments
-                    ],
-                    collect(values(testitems_to_run_by_id)),
-                    pairs(JuliaWorkspaces.get_test_items(jw)) |>
-                        @map({uri = _.first, items = _.second.testsetups}) |>
-                        @mutate(
-                            project_details = JuliaWorkspaces.get_test_env(jw, _.uri),
-                            textfile = JuliaWorkspaces.get_text_file(jw, _.uri)
-                        ) |>
-                        @filter(_.project_details.package_uri !== nothing) |>
-                        @mapmany(
-                            _.items,
-                            TestItemControllers.TestSetupDetail(
-                                string(_.project_details.package_uri),
-                                string(__.name),
-                                string(__.kind),
-                                string(_.uri),
-                                JuliaWorkspaces.position_at(_.textfile.content, __.code_range.start)[1],
-                                JuliaWorkspaces.position_at(_.textfile.content, __.code_range.start)[2],
-                                _.textfile.content.content[__.code_range]
-                            )
-                        ) |>
-                        i-> collect(TestItemControllers.TestSetupDetail, i),
+                    test_envs,
+                    test_items,
+                    work_units,
+                    test_setups,
+                    max_workers,
                     token,
                 )
             catch err
@@ -647,7 +695,7 @@ function run_tests(
             end
 
             # Extract coverage data if coverage mode is enabled
-            if any(env -> env.coverage, environments) && ret !== missing && ret !== nothing
+            if any(env -> env.coverage, environments) && ret !== nothing
                 @info "Coverage data collected but not yet processed"
             end
 
@@ -695,22 +743,22 @@ function run_tests(
                 println()
                 label = i.result.status == :failed ? "FAIL" : "ERROR"
                 printstyled("  [$label] $(i.testitem.label)"; color=:red, bold=true)
-                if i.result.duration !== missing
+                if i.result.duration !== nothing
                     print(" ($(i.result.duration)ms)")
                 end
                 println()
-                if i.result.messages!==missing                
+                if i.result.messages!==nothing                
                     for j in i.result.messages
                         println("    ", replace(j.message, "\n"=>"\n    "))
-                        if j.expectedOutput !== missing || j.actualOutput !== missing
-                            j.expectedOutput !== missing && println("    Expected: ", replace(j.expectedOutput, "\n"=>"\n             "))
-                            j.actualOutput !== missing && println("    Actual:   ", replace(j.actualOutput, "\n"=>"\n             "))
+                        if j.expected_output !== nothing || j.actual_output !== nothing
+                            j.expected_output !== nothing && println("    Expected: ", replace(j.expected_output, "\n"=>"\n             "))
+                            j.actual_output !== nothing && println("    Actual:   ", replace(j.actual_output, "\n"=>"\n             "))
                         end
-                        if j.stackTrace !== missing
-                            for frame in j.stackTrace
-                                frame_uri = frame.uri !== missing ? frame.uri : "?"
-                                frame_line = coalesce(frame.line, 0)
-                                frame_col = coalesce(frame.column, 0)
+                        if j.stack_trace !== nothing
+                            for frame in j.stack_trace
+                                frame_uri = frame.uri !== nothing ? frame.uri : "?"
+                                frame_line = something(frame.line, 0)
+                                frame_col = something(frame.column, 0)
                                 println("      at $(frame.label) ($(frame_uri):$(frame_line):$(frame_col))")
                             end
                         end
@@ -734,7 +782,7 @@ function run_tests(
                 ti.result.status,
                 ti.result.duration,
                 _convert_messages(ti.result.messages),
-                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : missing
+                haskey(testitem_outputs, ti.testitem.id) ? join(testitem_outputs[ti.testitem.id]) : nothing
             )]
         ) for ti in responses
     ]
