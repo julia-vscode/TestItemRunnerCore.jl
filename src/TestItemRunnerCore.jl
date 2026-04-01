@@ -18,7 +18,7 @@ using Query
 using JuliaWorkspaces: JuliaWorkspace
 using JuliaWorkspaces.URIs2: URI, filepath2uri, uri2filepath
 using AutoHashEquals: @auto_hash_equals
-using TestItemControllers: TestItemController, ControllerCallbacks
+using TestItemControllers: TestItemController, ControllerCallbacks, wait_for_shutdown
 using TestItemControllers.CancellationTokens: CancellationTokenSource, CancellationToken,
     cancel, get_token, is_cancellation_requested
 
@@ -114,6 +114,7 @@ end
 
 mutable struct TestItemRunner
     controller::TestItemController
+    reactor_task::Union{Nothing,Task}
     lock::ReentrantLock
     run_contexts::Dict{String,RunContext}
     processes::Dict{String,ProcessInfo}
@@ -127,6 +128,7 @@ end
 function TestItemRunner(controller::TestItemController; max_history::Int=20)
     TestItemRunner(
         controller,
+        nothing,
         ReentrantLock(),
         Dict{String,RunContext}(),
         Dict{String,ProcessInfo}(),
@@ -397,7 +399,7 @@ function get_runner()
         controller = TestItemController(callbacks)
         runner = TestItemRunner(controller)
         _g_runner[] = runner
-        @async try
+        runner.reactor_task = @async try
             run(runner.controller)
         catch err
             Base.display_error(err, catch_backtrace())
@@ -813,7 +815,11 @@ end
 
 function kill_test_processes()
     if isassigned(_g_runner)
-        TestItemControllers.shutdown(_g_runner[].controller)
+        runner = _g_runner[]
+        TestItemControllers.shutdown(runner.controller)
+        if runner.reactor_task !== nothing
+            wait_for_shutdown(runner.controller, runner.reactor_task)
+        end
     end
 end
 
